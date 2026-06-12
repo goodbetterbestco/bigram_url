@@ -1,10 +1,14 @@
-# Scan results
+# Scan results (sorted by phrase commonality)
 
-- **Candidates generated:** 9466 (common two-word phrases where word2 is an English-word gTLD)
-- **DNS pre-cull (registered, dropped):** ~4,955
-- **AVAILABLE (RDAP 404, confirmed):** 3777
-- **Taken (RDAP 200):** 618
-- **Pending (CentralNic RDAP/WHOIS quota exhausted, HTTP 403):** 230 -- all on rdap.nic.* TLDs; re-run after quota reset (see pending_centralnic.txt)
+Common two-word English phrases registrable as `word1.word2` (word2 = an
+English-word gTLD), checked live via RDAP. Lists are sorted by phrase_count
+(Google/Norvig web-bigram frequency) descending = most common phrase first.
 
-Deliverables: `available_domains.csv`, `available_domains.txt`.
-Availability = registrable per RDAP; price/premium not verified (see README, premium_likely flag).
+- Candidates generated: 9466
+- DNS pre-culled as registered: ~4,955
+- **AVAILABLE (confirmed, RDAP 404): 3957**
+- Taken (RDAP 200): 646
+- Unresolved (CentralNic quota, retry on reset): 32
+
+Files: available_domains.csv (with rank), available_domains.txt.
+Availability = registrable per RDAP; price/premium not verified (premium_likely flag).

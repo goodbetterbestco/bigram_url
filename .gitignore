@@ -12,3 +12,7 @@ candidates.jsonl
 # scratch scan outputs (the curated deliverable lives in results/ and is committed)
 results.jsonl
 results_*.jsonl
+
+# scan log
+scan.log
+cn_poll.log
