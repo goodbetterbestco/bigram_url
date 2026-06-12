@@ -111,7 +111,7 @@ def load_done(out_path):
 async def run(candidates, out_path, inflight=60, base_interval=1.0,
               min_interval=1.0, max_interval=30.0, timeout=12,
               max_retries=3, retry_after_cap=90.0, host_budget=6000.0,
-              deadline_seconds=None):
+              max_unknown_streak=8, deadline_seconds=None):
     """Scan candidates (list of dicts with 'domain','w1','w2') via RDAP.
 
     Host-sharded: each RDAP back-end drains its own queue at a polite, steady
@@ -196,6 +196,7 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
             host = base.split("/")[2]
             interval = base_interval
             ok_streak = 0
+            unk_streak = 0
             host_start = loop.time()
             for c, _ in items:
                 now = loop.time()
@@ -203,6 +204,10 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
                     break  # global deadline: leave the rest for a resume
                 if now - host_start > host_budget:
                     break  # this host took too long; defer rest to a resume
+                if unk_streak >= max_unknown_streak:
+                    # host is persistently rate-limiting us -- stop poking it,
+                    # defer the rest to a later (spaced-out) resume. Polite.
+                    break
                 status = code = None
                 for attempt in range(max_retries + 1):
                     try:
@@ -225,7 +230,9 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
                     break  # definitive (available/taken/unknown-http)
                 if status in ("_retry", "_err"):
                     status, code = UNKNOWN, code
+                    unk_streak += 1
                 else:
+                    unk_streak = 0
                     ok_streak += 1
                     if ok_streak >= 40 and interval > min_interval:
                         interval = max(min_interval, interval * 0.85)
