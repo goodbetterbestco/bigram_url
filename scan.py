@@ -152,9 +152,10 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--dns-cull", action="store_true",
                     help="cheap DNS pre-filter to drop clearly-taken names")
-    ap.add_argument("--concurrency", type=int, default=40)
-    ap.add_argument("--per-host-interval", type=float, default=1.0,
-                    help="polite seconds between queries to the same registry")
+    ap.add_argument("--inflight", type=int, default=60,
+                    help="max concurrent HTTP requests across all hosts")
+    ap.add_argument("--base-interval", type=float, default=1.0,
+                    help="polite starting seconds between queries to one host")
     ap.add_argument("--deadline-seconds", type=float, default=None,
                     help="stop starting RDAP queries after N s (resumable)")
     ap.add_argument("--confirm-price", action="store_true")
@@ -170,8 +171,8 @@ def main():
     if args.dns_cull:
         cands, taken_dns = dns_cull(cands)
 
-    results = asyncio.run(rdap.run(cands, args.out, args.concurrency,
-                                   args.per_host_interval,
+    results = asyncio.run(rdap.run(cands, args.out, inflight=args.inflight,
+                                   base_interval=args.base_interval,
                                    deadline_seconds=args.deadline_seconds))
 
     all_cands = load_candidates(args.candidates, args.limit)

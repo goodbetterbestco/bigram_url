@@ -1,30 +1,36 @@
 """
-RDAP-based availability checker -- polite, adaptive, resumable.
+RDAP-based availability checker -- polite, host-sharded, adaptive, resumable.
 
-RDAP (RFC 7480-9) is the modern, structured replacement for WHOIS. ICANN
-*mandates* an RDAP server for every gTLD, so for the word-gTLDs we care about
-(.live, .zone, .world, ...) coverage is excellent and the signal is clean:
+RDAP (RFC 7480-9) is the structured replacement for WHOIS; ICANN mandates an
+RDAP server for every gTLD, so the word-gTLDs we care about have clean
+semantics:
 
     GET {rdap_base}/domain/{name}
-      HTTP 404  -> NOT registered  => AVAILABLE
-      HTTP 200  -> registered      => taken
-      HTTP 429  -> rate limited     => honor Retry-After, slow this host, retry
-      other/timeout -> UNKNOWN      => recheck later
+      404 -> not registered  => AVAILABLE
+      200 -> registered      => taken
+      429/503 -> rate limited => honor Retry-After, slow THIS host, retry
+      other/timeout -> UNKNOWN (retryable on a later run)
 
-Politeness is the whole design here (we must not hammer registries):
-  * Per-host serial pacing: each registry's RDAP host is queried no faster than
-    its current interval, with jitter. Hosts are independent, so many run in
-    parallel without any single registry seeing a burst.
-  * ADAPTIVE backoff: a 429 from a host multiplicatively increases that host's
-    interval (and we obey Retry-After exactly); sustained success slowly relaxes
-    it. The scanner self-tunes to each registry's real limit instead of guessing.
-  * Resumable + deadline: results are checkpointed to JSONL as we go, so a run
-    can stop at a deadline (to stay under a wall-clock budget) and resume later
-    without re-querying anything.
+KEY FACT that drives the design: the ~376 word-gTLDs are operated by only ~54
+RDAP back-ends, and ONE of them (Identity Digital) runs the majority of them
+(.life/.world/.live/.news/.zone/...). So the work does NOT fan out evenly --
+most of it funnels through a few hosts. Politeness therefore means pacing
+*per host*, and the wall-clock is bounded by the busiest host's queue.
 
-Caveat (see README): RDAP says nothing about *price*. A 404 can still be a
-registry-premium name or a reserved label; closed dot-brand and credential-gated
-TLDs are excluded upstream in candidates.py / tld_words.py.
+Design:
+  * Shard candidates by RDAP host. One drain() coroutine per host walks that
+    host's queue serially, sleeping `interval` between requests (adaptive).
+  * A global semaphore caps the number of in-flight HTTP requests, and is held
+    ONLY around the GET -- never during a sleep. So a slow/throttled host never
+    blocks the others (the bug that sank the first version).
+  * Adaptive pacing: start at base_interval; a 429 doubles this host's interval
+    (capped) and obeys Retry-After; a streak of successes relaxes it toward a
+    floor. Each registry self-tunes to its own tolerance.
+  * Resumable + deadline-bounded: only definitive results (available/taken) are
+    treated as done; a run can stop at a deadline and resume without re-querying.
+
+Caveat (see README): RDAP says nothing about price. Premium/reserved names and
+closed dot-brand / credential-gated TLDs are handled upstream in tld_words.py.
 """
 
 import argparse
@@ -49,7 +55,9 @@ AVAILABLE = "available"
 TAKEN = "taken"
 UNKNOWN = "unknown"
 NO_RDAP = "no_rdap_server"
-SKIPPED = "skipped_deadline"
+
+# statuses we consider definitive (won't change on a re-run)
+_DONE = {AVAILABLE, TAKEN}
 
 
 async def load_bootstrap(session, max_age=86400):
@@ -75,109 +83,38 @@ async def load_bootstrap(session, max_age=86400):
 
 
 def _parse_retry_after(value):
-    """Retry-After may be seconds or an HTTP date. Return seconds (float)."""
     if not value:
         return None
     value = value.strip()
     if value.isdigit():
         return float(value)
     dt = email.utils.parsedate_to_datetime(value)
-    if dt is None:
-        return None
-    return max(0.0, dt.timestamp() - time.time())
-
-
-class AdaptiveThrottle:
-    """Per-host serial pacer that backs off on 429 and relaxes on success.
-
-    Each host has its own current interval. We never issue two requests to the
-    same host closer together than that interval (+ jitter). A 429 doubles the
-    interval (capped); a streak of successes nudges it back toward the floor.
-    """
-
-    def __init__(self, base_interval=1.0, min_interval=0.5, max_interval=120.0):
-        self.base = base_interval
-        self.floor = min_interval
-        self.ceil = max_interval
-        self.interval = defaultdict(lambda: base_interval)
-        self._next = defaultdict(float)
-        self._ok_streak = defaultdict(int)
-        self._locks = defaultdict(asyncio.Lock)
-
-    async def wait(self, host):
-        async with self._locks[host]:
-            now = time.monotonic()
-            if self._next[host] > now:
-                await asyncio.sleep(self._next[host] - now)
-            now = time.monotonic()
-            jitter = self.interval[host] * random.uniform(0.0, 0.25)
-            self._next[host] = now + self.interval[host] + jitter
-
-    def on_429(self, host, retry_after=None):
-        self._ok_streak[host] = 0
-        self.interval[host] = min(self.ceil, max(self.interval[host] * 2,
-                                                 self.base * 2))
-        if retry_after is not None:
-            # do not query this host again until retry_after has elapsed
-            self._next[host] = max(self._next[host],
-                                   time.monotonic() + retry_after)
-
-    def on_success(self, host):
-        self._ok_streak[host] += 1
-        if self._ok_streak[host] >= 20 and self.interval[host] > self.floor:
-            self.interval[host] = max(self.floor, self.interval[host] * 0.8)
-            self._ok_streak[host] = 0
-
-
-async def check_one(session, domain, rdap_base, throttle, retries=4):
-    if not rdap_base:
-        return NO_RDAP, None
-    host = rdap_base.split("/")[2]
-    url = f"{rdap_base}/domain/{domain}"
-    for attempt in range(retries + 1):
-        await throttle.wait(host)
-        try:
-            async with session.get(url, allow_redirects=True) as resp:
-                if resp.status == 404:
-                    throttle.on_success(host)
-                    return AVAILABLE, 404
-                if resp.status == 200:
-                    throttle.on_success(host)
-                    return TAKEN, 200
-                if resp.status in (429, 503):
-                    ra = _parse_retry_after(resp.headers.get("Retry-After"))
-                    throttle.on_429(host, ra)
-                    continue
-                # 400/403/422/5xx etc -> registry quirk; treat as unknown
-                return UNKNOWN, resp.status
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            # transient network error: brief backoff, then retry
-            await asyncio.sleep(min(30.0, 2.0 ** attempt))
-    return UNKNOWN, None
+    return max(0.0, dt.timestamp() - time.time()) if dt else None
 
 
 def load_done(out_path):
+    """Map domain -> status, counting only DEFINITIVE results as done so that
+    unknown/no-rdap rows are retried on a resume."""
     done = {}
     if os.path.exists(out_path):
         with open(out_path) as fh:
             for line in fh:
                 try:
                     r = json.loads(line)
-                    # a deadline-skipped record is NOT done; let it retry
-                    if r.get("status") != SKIPPED:
+                    if r.get("status") in _DONE:
                         done[r["domain"]] = r["status"]
                 except (json.JSONDecodeError, KeyError):
                     pass
     return done
 
 
-async def run(candidates, out_path, concurrency=40, per_host_interval=1.0,
-              timeout=20, deadline_seconds=None):
-    """candidates: list of dicts with at least {'domain','w1','w2'}.
+async def run(candidates, out_path, inflight=60, base_interval=1.0,
+              min_interval=0.5, max_interval=90.0, timeout=12,
+              max_retries=3, deadline_seconds=None):
+    """Scan candidates (list of dicts with 'domain','w1','w2') via RDAP.
 
-    Resumable: anything already in out_path with a real status is skipped.
-    deadline_seconds: stop starting new queries after this many seconds (the
-    in-flight ones finish); remaining candidates are left for a resume.
+    Host-sharded: each RDAP back-end drains its own queue at an adaptive pace.
+    Wall-clock is governed by the busiest host (e.g. Identity Digital).
     """
     done = load_done(out_path)
     todo = [c for c in candidates if c["domain"] not in done]
@@ -186,71 +123,124 @@ async def run(candidates, out_path, concurrency=40, per_host_interval=1.0,
     if not todo:
         return done
 
-    throttle = AdaptiveThrottle(base_interval=per_host_interval)
-    sem = asyncio.Semaphore(concurrency)
-    conn = aiohttp.TCPConnector(limit=concurrency, ttl_dns_cache=600)
+    sem = asyncio.Semaphore(inflight)
+    conn = aiohttp.TCPConnector(limit=inflight, ttl_dns_cache=600)
     headers = {"User-Agent": USER_AGENT, "Accept": "application/rdap+json"}
     to = aiohttp.ClientTimeout(total=timeout)
 
     counts = defaultdict(int)
-    start = time.monotonic()
+    loop = asyncio.get_event_loop()
+    start = loop.time()
     deadline = start + deadline_seconds if deadline_seconds else None
 
     try:
         from tqdm import tqdm
-        bar = tqdm(total=len(todo), unit="dom", smoothing=0.05)
+        bar = tqdm(total=len(todo), unit="dom", smoothing=0.02)
     except ImportError:
         bar = None
 
     async with aiohttp.ClientSession(connector=conn, headers=headers,
                                      timeout=to) as session:
         rdap_map = await load_bootstrap(session)
+
+        by_host = defaultdict(list)
+        no_rdap = []
+        for c in todo:
+            base = rdap_map.get(c["w2"])
+            (no_rdap.append(c) if not base else by_host[base].append((c, base)))
+
         out = open(out_path, "a", encoding="utf-8")
         lock = asyncio.Lock()
 
-        async def worker(c):
-            async with sem:
-                if deadline and time.monotonic() > deadline:
-                    status, code = SKIPPED, None
-                else:
-                    base = rdap_map.get(c["w2"])
-                    status, code = await check_one(session, c["domain"], base,
-                                                   throttle)
-            rec = {**c, "status": status, "http": code}
+        async def emit(rec):
             async with lock:
-                if status != SKIPPED:
-                    out.write(json.dumps(rec) + "\n")
-                    out.flush()
-                counts[status] += 1
+                out.write(json.dumps(rec) + "\n")
+                out.flush()
+                counts[rec["status"]] += 1
                 if bar:
                     bar.update(1)
                     bar.set_postfix(avail=counts[AVAILABLE], taken=counts[TAKEN],
-                                    unk=counts[UNKNOWN] + counts[NO_RDAP],
-                                    refresh=False)
-            return rec
+                                    unk=counts[UNKNOWN], refresh=False)
 
-        await asyncio.gather(*(worker(c) for c in todo))
+        for c in no_rdap:
+            await emit({**c, "status": NO_RDAP, "http": None})
+
+        async def fetch(domain, base):
+            """One GET. Returns (status, code, retry_after). Holds the network
+            slot only for the request itself."""
+            url = f"{base}/domain/{domain}"
+            async with sem:
+                try:
+                    async with session.get(url, allow_redirects=True) as r:
+                        if r.status == 404:
+                            return AVAILABLE, 404, None
+                        if r.status == 200:
+                            return TAKEN, 200, None
+                        if r.status in (429, 503):
+                            return "_retry", r.status, _parse_retry_after(
+                                r.headers.get("Retry-After"))
+                        return UNKNOWN, r.status, None
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    return "_err", None, None
+
+        async def drain(base, items):
+            host = base.split("/")[2]
+            interval = base_interval
+            ok_streak = 0
+            for c, _ in items:
+                if deadline and loop.time() > deadline:
+                    break  # leave the rest of this host for a resume
+                status = code = None
+                for attempt in range(max_retries + 1):
+                    status, code, ra = await fetch(c["domain"], base)
+                    if status == "_retry":
+                        interval = min(max_interval, max(interval * 2,
+                                                         base_interval * 2))
+                        ok_streak = 0
+                        await asyncio.sleep(ra if ra is not None else interval)
+                        continue
+                    if status == "_err":
+                        await asyncio.sleep(min(15.0, 2.0 ** attempt))
+                        continue
+                    break  # definitive (available/taken/unknown-http)
+                if status in ("_retry", "_err"):
+                    status, code = UNKNOWN, code
+                else:
+                    ok_streak += 1
+                    if ok_streak >= 25 and interval > min_interval:
+                        interval = max(min_interval, interval * 0.8)
+                        ok_streak = 0
+                await emit({**c, "status": status, "http": code})
+                # pace before the next request to THIS host (no slot held)
+                await asyncio.sleep(interval * random.uniform(0.9, 1.25))
+
+        sizes = sorted((len(v) for v in by_host.values()), reverse=True)
+        print(f"sharded over {len(by_host)} RDAP hosts; "
+              f"busiest holds {sizes[0] if sizes else 0} names "
+              f"(this bounds the wall-clock)")
+
+        await asyncio.gather(*(drain(b, items) for b, items in by_host.items()))
         out.close()
 
     if bar:
         bar.close()
-    elapsed = time.monotonic() - start
+    elapsed = loop.time() - start
     print(f"done in {elapsed/60:.1f} min: {dict(counts)}")
-    if deadline and counts[SKIPPED]:
-        print(f"NOTE: hit deadline; {counts[SKIPPED]} left -- rerun to resume.")
+    remaining = len(todo) - sum(counts.values())
+    if deadline and remaining > 0:
+        print(f"NOTE: deadline hit; ~{remaining} unqueried -- rerun to resume.")
     return load_done(out_path)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Polite RDAP availability scan")
+    ap = argparse.ArgumentParser(description="Polite host-sharded RDAP scan")
     ap.add_argument("--candidates", default="candidates.jsonl")
     ap.add_argument("--out", default="results.jsonl")
-    ap.add_argument("--concurrency", type=int, default=40)
-    ap.add_argument("--per-host-interval", type=float, default=1.0,
-                    help="seconds between requests to the SAME registry (polite "
-                         "floor; auto-increases on 429)")
-    ap.add_argument("--deadline-seconds", type=float, default=None,
-                    help="stop starting queries after N seconds (resumable)")
+    ap.add_argument("--inflight", type=int, default=60,
+                    help="max concurrent HTTP requests across all hosts")
+    ap.add_argument("--base-interval", type=float, default=1.0,
+                    help="starting seconds between requests to the SAME host")
+    ap.add_argument("--deadline-seconds", type=float, default=None)
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
@@ -263,10 +253,9 @@ def main():
     if args.limit:
         cands = cands[: args.limit]
 
-    results = asyncio.run(run(cands, args.out, args.concurrency,
-                              args.per_host_interval,
+    results = asyncio.run(run(cands, args.out, inflight=args.inflight,
+                              base_interval=args.base_interval,
                               deadline_seconds=args.deadline_seconds))
-
     avail = sorted(d for d, s in results.items() if s == AVAILABLE)
     print(f"\n=== {len(avail)} AVAILABLE phrase domains ===")
     for d in avail[:60]:
