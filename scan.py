@@ -130,10 +130,12 @@ def export(available, taken_via_dns, outdir="results"):
     txt_path = os.path.join(outdir, "available_domains.txt")
     with open(csv_path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["domain", "word1", "tld", "phrase_count",
+        # rank = stable position in the commonality sort, so the original order
+        # is recoverable after the user sorts/filters in a spreadsheet.
+        w.writerow(["rank", "domain", "word1", "tld", "phrase_count",
                     "premium_likely", "restricted"])
-        for r in rows:
-            w.writerow([r["domain"], r["w1"], r["w2"], r.get("count", 0),
+        for i, r in enumerate(rows, 1):
+            w.writerow([i, r["domain"], r["w1"], r["w2"], r.get("count", 0),
                         int(bool(r.get("premium"))), int(bool(r.get("restricted")))])
     with open(txt_path, "w") as fh:
         for r in rows:
