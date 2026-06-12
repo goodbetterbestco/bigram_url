@@ -28,7 +28,7 @@ usable English words**. So you never enumerate the web; you enumerate
 ```
 
 From Peter Norvig's 250,000 most-frequent web bigrams, that intersection is
-only **~9,700 candidate domains across ~315 TLDs** (after dropping function-word
+only **~9,500 candidate domains across ~311 TLDs** (after dropping function-word
 phrases and registry-reserved labels). That's small enough to check exhaustively
 in minutes.
 
@@ -43,7 +43,7 @@ in minutes.
                     scan.py
    ┌───────────────────┼───────────────────────────────┐
    │ 1. DNS cull (opt) │ resolves? → taken, drop it. ~1000s/sec. Cheap.
-   │ 2. RDAP scan      │ 404=available, 200=taken. Sharded per-TLD. PRIMARY.
+   │ 2. RDAP scan      │ 404=available, 200=taken. Sharded per RDAP host. PRIMARY.
    │ 3. Price confirm  │ registrar API → premium flag + renewal price.
    │    (opt)          │ The ONLY signal that means "actually buyable".
    └───────────────────┴───────────────────────────────┘
@@ -83,38 +83,42 @@ Quick smoke test with zero downloads: `python candidates.py --source demo`.
 
 ## How long does it take?
 
-In principle, RDAP work **self-shards across ~315 independent registry servers**
-(each TLD has its own RDAP endpoint), so the theoretical floor is the *busiest
-single TLD* — `.one` with 307 names at ~2 qps ≈ **~2.5 min**.
+The intuition "each TLD has its own RDAP server, so the work fans out over
+hundreds of registries" is **wrong**, and assuming it cost me a 6-hour failed
+run. In reality the ~376 word-gTLDs resolve to only **~54 RDAP back-ends**, and
+**one of them — Identity Digital — operates the majority** of them
+(.life/.world/.live/.news/.zone/.today/.city/...). Of 9,466 candidates, **5,698
+hit that single host.** So the load funnels onto a few endpoints, and the
+wall-clock is governed by the busiest one, paced politely.
 
-In practice it's slower, and measuring it honestly matters. Empirically (this
-machine, polite throttle of ~2 qps/host, concurrency 40):
+Two consequences shaped the design:
+1. **Shard by host, not by TLD.** `rdap.py` groups candidates by RDAP back-end
+   and drains each host's queue with its own adaptive pacer. The global
+   in-flight semaphore is held *only* around each HTTP request — never during a
+   pacing sleep — so the dominant host can't stall the others. (The first
+   version held a slot during the sleep; all slots jammed behind Identity
+   Digital and throughput collapsed to ~0.01 domains/sec.)
+2. **DNS pre-cull is a big lever.** `--dns-cull` drops names with NS records
+   (already registered) before RDAP — here it removed **4,957 of 9,466**, so
+   only ~4,500 names reach the registries at all.
 
-| working set | regime | sustained throughput |
-|---|---|---|
-| 400 most-frequent phrases | clustered into a few popular TLDs | ~4 dom/s |
-| ~470 random phrases | spread across ~300 TLDs | **~2.5 dom/s, decelerating** |
+Measured throughput (this machine): **~3.6 domains/sec** sustained, bursting to
+30+/sec while the ~53 small hosts drain, then settling to the pace of the
+Identity-Digital tail. A **full sweep of ~9,500 candidates completes in roughly
+30–45 minutes** — bounded by politely metering the one dominant registry
+(default 1 req/sec/host, relaxing to 2/sec on sustained success, backing off on
+429), not by CPU or the candidate count.
 
-The diverse sample is *slower*, not faster — because real registries enforce
-their own rate limits, returning HTTP 429 and forcing exponential backoff, and
-the tail of the run concentrates on the slowest / most-throttled registry
-endpoints (observed >5 s/domain near the end). So the busiest-TLD floor is not
-achievable in practice.
-
-**Realistic full sweep of ~9,700 candidates: roughly 30–90 minutes** of polite
-scanning, dominated by per-registry rate limits and the slow tail, not by CPU or
-the candidate count. Levers that help:
-- **DNS pre-cull first** (`--dns-cull`, thousands/sec) removes the large fraction
-  of already-taken common phrases before they ever reach RDAP.
-- **Tune throttling per registry** rather than one global rate; the fast
-  registries can take 5+ qps while a few slow ones gate everything.
+Politeness levers / notes:
+- Every host self-tunes: a 429 doubles that host's interval and we obey
+  `Retry-After`; we never parallelize across IPs to evade caps.
+- The run is **resumable** (only definitive available/taken count as done) and
+  **deadline-bounded** (`--deadline-seconds`) so it can fit a wall-clock budget.
 - A **registrar batch API** (Name.com: 50 names/call, 3000 calls/hr ⇒ ~150k
-  names/hr) is both faster *and* returns price/premium — at the cost of an
-  account and a monthly quota.
+  names/hr) is faster *and* returns price/premium — at the cost of an account.
 
-Bottom line: this is a **minutes-to-an-hour** job, not a multi-day crawl,
-because the search space is only ~10k names. The wall-clock is a politeness/
-rate-limit budget, not an algorithmic one.
+Bottom line: a **half-hour** job, because the search space is only ~10k names
+and the real bottleneck is one registry's polite rate limit.
 
 ## Important caveats (RDAP "available" ≠ "buyable")
 

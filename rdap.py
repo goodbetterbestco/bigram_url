@@ -109,12 +109,21 @@ def load_done(out_path):
 
 
 async def run(candidates, out_path, inflight=60, base_interval=1.0,
-              min_interval=0.5, max_interval=90.0, timeout=12,
-              max_retries=3, deadline_seconds=None):
+              min_interval=1.0, max_interval=30.0, timeout=12,
+              max_retries=3, retry_after_cap=90.0, host_budget=6000.0,
+              deadline_seconds=None):
     """Scan candidates (list of dicts with 'domain','w1','w2') via RDAP.
 
-    Host-sharded: each RDAP back-end drains its own queue at an adaptive pace.
-    Wall-clock is governed by the busiest host (e.g. Identity Digital).
+    Host-sharded: each RDAP back-end drains its own queue at a polite, steady
+    pace (default 1 req/sec/host). Wall-clock is governed by the busiest host
+    (Identity Digital, which runs most word-gTLDs).
+
+    Three guardrails make a single misbehaving host unable to stall the run:
+      * retry_after_cap : never honor a 429 Retry-After longer than this in one
+        sleep (a registry that penalty-boxes us for an hour must not hang us).
+      * host_budget     : max seconds any one host's drain may run, then it
+        stops and leaves the rest for a resume.
+      * a hard per-request timeout wraps every GET.
     """
     done = load_done(out_path)
     todo = [c for c in candidates if c["domain"] not in done]
@@ -187,17 +196,28 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
             host = base.split("/")[2]
             interval = base_interval
             ok_streak = 0
+            host_start = loop.time()
             for c, _ in items:
-                if deadline and loop.time() > deadline:
-                    break  # leave the rest of this host for a resume
+                now = loop.time()
+                if deadline and now > deadline:
+                    break  # global deadline: leave the rest for a resume
+                if now - host_start > host_budget:
+                    break  # this host took too long; defer rest to a resume
                 status = code = None
                 for attempt in range(max_retries + 1):
-                    status, code, ra = await fetch(c["domain"], base)
+                    try:
+                        status, code, ra = await asyncio.wait_for(
+                            fetch(c["domain"], base), timeout=timeout + 5)
+                    except asyncio.TimeoutError:
+                        status, code, ra = "_err", None, None
                     if status == "_retry":
+                        # back off this host; honor Retry-After but CAP it so a
+                        # long penalty-box can never hang the run.
                         interval = min(max_interval, max(interval * 2,
                                                          base_interval * 2))
                         ok_streak = 0
-                        await asyncio.sleep(ra if ra is not None else interval)
+                        wait = ra if ra is not None else interval
+                        await asyncio.sleep(min(retry_after_cap, wait))
                         continue
                     if status == "_err":
                         await asyncio.sleep(min(15.0, 2.0 ** attempt))
@@ -207,8 +227,8 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
                     status, code = UNKNOWN, code
                 else:
                     ok_streak += 1
-                    if ok_streak >= 25 and interval > min_interval:
-                        interval = max(min_interval, interval * 0.8)
+                    if ok_streak >= 40 and interval > min_interval:
+                        interval = max(min_interval, interval * 0.85)
                         ok_streak = 0
                 await emit({**c, "status": status, "http": code})
                 # pace before the next request to THIS host (no slot held)
