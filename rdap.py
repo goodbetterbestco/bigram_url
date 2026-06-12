@@ -60,6 +60,19 @@ NO_RDAP = "no_rdap_server"
 _DONE = {AVAILABLE, TAKEN}
 
 
+def pacing_key(rdap_base):
+    """Group RDAP endpoints that share a back-end (and thus a rate/quota limit)
+    so we pace them as ONE logical host. CentralNic/Team Internet front many
+    TLDs as rdap.nic.<tld> but enforce a single shared per-IP query quota --
+    hammering them in parallel (one 'host' each) trips it and returns
+    HTTP 403 'Number of allowed queries exceeded'. Treat them as one.
+    """
+    host = rdap_base.split("/")[2].lower()
+    if host.startswith("rdap.nic.") or "centralnic" in host:
+        return "centralnic-shared"
+    return host
+
+
 async def load_bootstrap(session, max_age=86400):
     """tld -> rdap base url, from IANA bootstrap (cached on disk)."""
     if os.path.exists(BOOTSTRAP_CACHE) and (
@@ -152,11 +165,13 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
                                      timeout=to) as session:
         rdap_map = await load_bootstrap(session)
 
+        # group by shared back-end (pacing_key), carrying each item's own base
         by_host = defaultdict(list)
         no_rdap = []
         for c in todo:
             base = rdap_map.get(c["w2"])
-            (no_rdap.append(c) if not base else by_host[base].append((c, base)))
+            (no_rdap.append(c) if not base
+             else by_host[pacing_key(base)].append((c, base)))
 
         out = open(out_path, "a", encoding="utf-8")
         lock = asyncio.Lock()
@@ -192,13 +207,12 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     return "_err", None, None
 
-        async def drain(base, items):
-            host = base.split("/")[2]
+        async def drain(group, items):
             interval = base_interval
             ok_streak = 0
             unk_streak = 0
             host_start = loop.time()
-            for c, _ in items:
+            for c, item_base in items:
                 now = loop.time()
                 if deadline and now > deadline:
                     break  # global deadline: leave the rest for a resume
@@ -212,7 +226,7 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
                 for attempt in range(max_retries + 1):
                     try:
                         status, code, ra = await asyncio.wait_for(
-                            fetch(c["domain"], base), timeout=timeout + 5)
+                            fetch(c["domain"], item_base), timeout=timeout + 5)
                     except asyncio.TimeoutError:
                         status, code, ra = "_err", None, None
                     if status == "_retry":
@@ -242,11 +256,11 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
                 await asyncio.sleep(interval * random.uniform(0.9, 1.25))
 
         sizes = sorted((len(v) for v in by_host.values()), reverse=True)
-        print(f"sharded over {len(by_host)} RDAP hosts; "
+        print(f"sharded over {len(by_host)} RDAP back-ends; "
               f"busiest holds {sizes[0] if sizes else 0} names "
               f"(this bounds the wall-clock)")
 
-        await asyncio.gather(*(drain(b, items) for b, items in by_host.items()))
+        await asyncio.gather(*(drain(g, items) for g, items in by_host.items()))
         out.close()
 
     if bar:
