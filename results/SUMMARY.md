@@ -1,13 +1,16 @@
-# Scan results (COMPLETE, sorted by phrase commonality)
+# Results (complete)
 
 Common two-word English phrases registrable as `word1.word2` (word2 = an
-English-word gTLD), checked live via RDAP. Sorted by phrase_count (web-bigram
-frequency) descending = most common phrase first; CSV has a stable `rank` column.
+English-word gTLD), checked live via RDAP and sorted by phrase commonality.
 
-- Candidates generated: 9466
-- DNS pre-culled as registered: ~4,955
-- **AVAILABLE (confirmed, RDAP 404): 3985**
-- Taken (RDAP 200): 650
-- Unresolved: 0  (scan is 100% complete)
+| metric | count |
+|---|---|
+| candidates (phrase x word-TLD) | 9466 |
+| DNS pre-culled as registered | ~4,955 |
+| **available (RDAP 404)** | **3985** |
+| taken (RDAP 200) | 650 |
+| unresolved | 0 |
 
-Availability = registrable per RDAP; price/premium not verified (premium_likely flag).
+`available_domains.csv` is sorted by `phrase_count` (web-bigram frequency)
+descending, with a stable `rank` column. Availability = registrable per RDAP;
+price/premium not verified (see `premium_likely`).
