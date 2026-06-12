@@ -134,6 +134,18 @@ keeps refusing, and grouping for shared back-ends (e.g. CentralNic). **Don't
 remove those.** For genuinely high-volume availability checking, use a registrar
 API or EPP, which is what registries actually want you to use.
 
+## Development
+
+Requires **Python 3.10+**. Install with dev extras and run the tests:
+
+```bash
+pip install -e ".[dev]"   # or: pip install -r requirements.txt && pip install pytest
+pytest                    # unit tests for label validation, TLD flags, RDAP parsing
+```
+
+The tests cover the pure logic (candidate filtering, the open/premium/restricted
+TLD flags, and the `Retry-After` / resume parsing in `rdap.py`) and run offline.
+
 ## Data sources & licenses
 
 - TLDs: [IANA root zone](https://data.iana.org/TLD/tlds-alpha-by-domain.txt) (public).

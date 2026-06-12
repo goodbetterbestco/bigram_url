@@ -20,7 +20,7 @@ network call -- per the registry-gotchas research):
   * strict LDH label rules (length 1-63, [a-z0-9-], no leading/trailing or
     3rd+4th-position double hyphen)
   * ICANN reserved labels dropped: single-char, two-char (reserved by default),
-    and nic/whois/www/rdds/example.
+    and nic/whois/www/rdds/rdap/example.
 
 Output: candidates.jsonl, highest phrase-frequency first:
   {"domain":"right.now","w1":"right","w2":"now","count":123456,
@@ -175,8 +175,8 @@ def main():
     ap.add_argument("--min-count", type=int, default=0)
     ap.add_argument("--min-zipf-w1", type=float, default=0.0,
                     help="min wordfreq zipf for word1 (e.g. 3.0 = fairly common)")
-    ap.add_argument("--include-premium", action="store_true",
-                    help="(on by default; premium are always generated+flagged)")
+    ap.add_argument("--exclude-premium", action="store_true",
+                    help="drop registry-premium-priced TLDs (kept + flagged by default)")
     ap.add_argument("--include-restricted", action="store_true",
                     help="also include credential-gated TLDs (.bank/.law/...)")
     ap.add_argument("--keep-stopwords", action="store_true",
@@ -184,7 +184,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
-    tld_set = buyable_tlds(include_premium=True,
+    tld_set = buyable_tlds(include_premium=not args.exclude_premium,
                            include_restricted=args.include_restricted)
 
     if args.source == "norvig":

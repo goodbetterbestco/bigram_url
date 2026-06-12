@@ -11,16 +11,20 @@ Method (matches the research recommendation):
   3. Intersect with a *commonness-graded* English dictionary so we keep only
      TLDs that are real, reasonably common words (a TLD like .ngo or .aero is
      delegated but isn't a useful phrase-word). We use wordfreq's zipf score.
-  4. Write word<TAB>category(blank)<TAB>premium_flag(0) -- premium/brand/
-     restricted flags are applied at load time in tld_words.py from its
-     curated CLOSED_BRAND / CREDENTIAL_RESTRICTED sets, so we don't try to
-     infer them here.
+  4. MERGE into the existing data/word_tlds.tsv. The `category` and
+     `premium_or_restricted` columns are HAND-CURATED, so for words already in
+     the file they are PRESERVED; only genuinely new TLDs are appended (with a
+     blank category / premium=0 for you to fill in), and words no longer
+     delegated are reported and dropped. This never silently wipes the curated
+     columns. (Brand/credential flags themselves live in tld_words.py's
+     CLOSED_BRAND / CREDENTIAL_RESTRICTED sets and are applied at load time.)
 
 Usage:
   python build_tld_words.py --min-zipf 3.0 --out data/word_tlds.tsv
 """
 
 import argparse
+import os
 import sys
 import urllib.request
 
@@ -69,14 +73,40 @@ def main():
             kept.append(t)
     kept.sort()
 
+    # preserve hand-curated category / premium columns from the existing file
+    existing = {}
+    if os.path.exists(args.out):
+        with open(args.out, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                word = parts[0].strip().lower()
+                cat = parts[1] if len(parts) > 1 else ""
+                prem = parts[2].strip() if len(parts) > 2 else "0"
+                existing[word] = (cat, prem)
+
+    kept_set = set(kept)
+    added = [t for t in kept if t not in existing]
+    removed = sorted(w for w in existing if w not in kept_set)
+
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(f"# word\tcategory\tpremium_or_restricted  "
-                 f"(derived from IANA root {version}, min_zipf={args.min_zipf})\n")
+                 f"(IANA root {version}, min_zipf={args.min_zipf}; "
+                 f"category/premium hand-curated and preserved on merge)\n")
         for t in kept:
-            fh.write(f"{t}\t\t0\n")
+            cat, prem = existing.get(t, ("", "0"))
+            fh.write(f"{t}\t{cat}\t{prem}\n")
 
-    print(f"wrote {len(kept)} word-TLDs -> {args.out}", file=sys.stderr)
-    print("  e.g.", ", ".join(kept[:30]), file=sys.stderr)
+    print(f"wrote {len(kept)} word-TLDs -> {args.out} "
+          f"({len(added)} new, {len(removed)} no longer delegated)",
+          file=sys.stderr)
+    if added:
+        print("  new (fill in category/premium):", ", ".join(added[:30]),
+              file=sys.stderr)
+    if removed:
+        print("  dropped (no longer delegated):", ", ".join(removed[:30]),
+              file=sys.stderr)
 
 
 if __name__ == "__main__":

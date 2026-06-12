@@ -59,6 +59,11 @@ NO_RDAP = "no_rdap_server"
 # statuses we consider definitive (won't change on a re-run)
 _DONE = {AVAILABLE, TAKEN}
 
+# adaptive-pacing tunables: after this many consecutive successes on a host,
+# relax its interval toward min_interval by this factor.
+RELAX_AFTER = 40
+RELAX_FACTOR = 0.85
+
 
 def pacing_key(rdap_base):
     """Group RDAP endpoints that share a back-end (and thus a rate/quota limit)
@@ -74,20 +79,34 @@ def pacing_key(rdap_base):
 
 
 async def load_bootstrap(session, max_age=86400):
-    """tld -> rdap base url, from IANA bootstrap (cached on disk)."""
+    """tld -> rdap base url, from IANA bootstrap (cached on disk).
+
+    Only a response that is HTTP-OK and actually contains 'services' is cached,
+    so a transient 500 / captive-portal / partial body can't poison the on-disk
+    cache for the next `max_age` seconds. A previously poisoned cache self-heals.
+    """
+    data = None
     if os.path.exists(BOOTSTRAP_CACHE) and (
         time.time() - os.path.getmtime(BOOTSTRAP_CACHE) < max_age
     ):
         with open(BOOTSTRAP_CACHE) as fh:
             data = json.load(fh)
-    else:
+        if not isinstance(data, dict) or "services" not in data:
+            data = None                        # poisoned cache -> refetch
+
+    if data is None:
         async with session.get(BOOTSTRAP_URL) as resp:
+            resp.raise_for_status()
             data = await resp.json(content_type=None)
+        if not isinstance(data, dict) or "services" not in data:
+            raise ValueError("IANA RDAP bootstrap response missing 'services'")
         with open(BOOTSTRAP_CACHE, "w") as fh:
             json.dump(data, fh)
 
     mapping = {}
     for entry in data.get("services", []):
+        if len(entry) < 2 or not entry[1]:    # malformed entry; skip defensively
+            continue
         tlds, urls = entry[0], entry[1]
         base = next((u for u in urls if u.startswith("https")), urls[0])
         for tld in tlds:
@@ -96,12 +115,24 @@ async def load_bootstrap(session, max_age=86400):
 
 
 def _parse_retry_after(value):
+    """Seconds to wait, from a Retry-After header (delta-seconds or HTTP-date).
+
+    Returns None on anything unparseable. This MUST NOT raise: it is reached
+    only on a 429/503, i.e. exactly when a registry is rate-limiting us, and the
+    header is fully registry-controlled -- a malformed value must never crash
+    the scan (parsedate_to_datetime raises ValueError on bad input).
+    """
     if not value:
         return None
     value = value.strip()
-    if value.isdigit():
-        return float(value)
-    dt = email.utils.parsedate_to_datetime(value)
+    try:
+        return max(0.0, float(value))          # delta-seconds (incl. "120.5")
+    except ValueError:
+        pass
+    try:
+        dt = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
     return max(0.0, dt.timestamp() - time.time()) if dt else None
 
 
@@ -151,7 +182,7 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
     to = aiohttp.ClientTimeout(total=timeout)
 
     counts = defaultdict(int)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     start = loop.time()
     deadline = start + deadline_seconds if deadline_seconds else None
 
@@ -203,14 +234,18 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
                         if r.status in (429, 503):
                             return "_retry", r.status, _parse_retry_after(
                                 r.headers.get("Retry-After"))
+                        if r.status == 403:
+                            # quota/forbidden (e.g. CentralNic "queries
+                            # exceeded") -- retrying won't help; defer the host.
+                            return "_blocked", 403, None
                         return UNKNOWN, r.status, None
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     return "_err", None, None
 
-        async def drain(group, items):
+        async def drain(items):
             interval = base_interval
             ok_streak = 0
-            unk_streak = 0
+            rl_streak = 0          # consecutive rate-limit / quota-block hits
             host_start = loop.time()
             for c, item_base in items:
                 now = loop.time()
@@ -218,8 +253,8 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
                     break  # global deadline: leave the rest for a resume
                 if now - host_start > host_budget:
                     break  # this host took too long; defer rest to a resume
-                if unk_streak >= max_unknown_streak:
-                    # host is persistently rate-limiting us -- stop poking it,
+                if rl_streak >= max_unknown_streak:
+                    # registry keeps rate-limiting us -- stop poking it and
                     # defer the rest to a later (spaced-out) resume. Polite.
                     break
                 status = code = None
@@ -229,6 +264,8 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
                             fetch(c["domain"], item_base), timeout=timeout + 5)
                     except asyncio.TimeoutError:
                         status, code, ra = "_err", None, None
+                    if status == "_blocked":
+                        break  # 403 quota block: retrying is pointless
                     if status == "_retry":
                         # back off this host; honor Retry-After but CAP it so a
                         # long penalty-box can never hang the run.
@@ -242,16 +279,23 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
                         await asyncio.sleep(min(15.0, 2.0 ** attempt))
                         continue
                     break  # definitive (available/taken/unknown-http)
-                if status in ("_retry", "_err"):
-                    status, code = UNKNOWN, code
-                    unk_streak += 1
+
+                blocked = status == "_blocked"
+                if status in ("_retry", "_err", "_blocked"):
+                    # only rate-limit/quota failures trip the breaker; a
+                    # transient network error shouldn't defer a healthy host.
+                    if blocked or code in (429, 503):
+                        rl_streak += 1
+                    status = UNKNOWN
                 else:
-                    unk_streak = 0
+                    rl_streak = 0
                     ok_streak += 1
-                    if ok_streak >= 40 and interval > min_interval:
-                        interval = max(min_interval, interval * 0.85)
+                    if ok_streak >= RELAX_AFTER and interval > min_interval:
+                        interval = max(min_interval, interval * RELAX_FACTOR)
                         ok_streak = 0
                 await emit({**c, "status": status, "http": code})
+                if blocked:
+                    break  # whole back-end is quota-blocked; defer the rest
                 # pace before the next request to THIS host (no slot held)
                 await asyncio.sleep(interval * random.uniform(0.9, 1.25))
 
@@ -260,7 +304,7 @@ async def run(candidates, out_path, inflight=60, base_interval=1.0,
               f"busiest holds {sizes[0] if sizes else 0} names "
               f"(this bounds the wall-clock)")
 
-        await asyncio.gather(*(drain(g, items) for g, items in by_host.items()))
+        await asyncio.gather(*(drain(items) for items in by_host.values()))
         out.close()
 
     if bar:

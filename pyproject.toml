@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bigram_url"
+version = "0.1.0"
+description = "Find registrable domains that spell a common two-word English phrase as word1.word2"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"   # uses PEP 604 'X | None' unions
+authors = [{ name = "Good Better Best Co" }]
+keywords = ["domains", "rdap", "domain-hack", "bigram", "availability"]
+dependencies = [
+    "aiohttp>=3.9",
+    "tqdm>=4.66",
+    "dnspython>=2.6",
+    "wordfreq>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/goodbetterbestco/bigram_url"
+
+[project.scripts]
+bigram-candidates = "candidates:main"
+bigram-scan = "scan:main"
+
+[tool.setuptools]
+py-modules = ["tld_words", "build_tld_words", "candidates", "rdap", "registrar_check", "scan"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]   # import the top-level modules from the repo root

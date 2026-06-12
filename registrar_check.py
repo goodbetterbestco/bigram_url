@@ -16,8 +16,11 @@ Without credentials, scan.py still works -- it just reports RDAP "available
 (unconfirmed)" and labels likely-premium TLDs so you know which to price-check.
 """
 
+import base64
 import json
 import os
+import sys
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
@@ -49,12 +52,15 @@ class NameComChecker:
             raise RuntimeError("set NAMECOM_USER and NAMECOM_TOKEN env vars")
 
     def _auth(self):
-        import base64
         raw = f"{self.user}:{self.token}".encode()
         return "Basic " + base64.b64encode(raw).decode()
 
     def check(self, domains):
-        """domains: list[str] -> list[PriceResult]. Batches of 50."""
+        """domains: list[str] -> list[PriceResult]. Batches of 50.
+
+        A failed batch is logged and skipped (its names simply don't appear in
+        the result) rather than crashing the whole price check.
+        """
         out = []
         for i in range(0, len(domains), self.BATCH):
             chunk = domains[i: i + self.BATCH]
@@ -64,8 +70,13 @@ class NameComChecker:
                 data=body, method="POST",
                 headers={"Authorization": self._auth(),
                          "Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = json.load(r)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    data = json.load(r)
+            except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
+                print(f"warning: price-check batch {i // self.BATCH} failed "
+                      f"({e}); skipping {len(chunk)} names", file=sys.stderr)
+                continue
             for res in data.get("results", []):
                 out.append(PriceResult(
                     domain=res.get("domainName", ""),

@@ -9,7 +9,7 @@ A candidate domain is  word1.word2  where:
 So this file defines the *closed* set of words allowed to be the second word.
 There are only ~1,440 delegated TLDs total and only a few hundred are real
 English words -- that small ceiling is what makes the whole search tractable
-(see README, "Why this is fast").
+(see README, "Why this is even tractable").
 
 The base list lives in data/word_tlds.tsv, derived from the live IANA root
 zone (regenerate with build_tld_words.py). On top of it we apply flags so the
@@ -41,7 +41,7 @@ _DATA = os.path.join(os.path.dirname(__file__), "data", "word_tlds.tsv")
 # NOTE: this hand-list is necessarily incomplete -- there are ~450 dot-brand
 # TLDs and ICANN's Spec-13 list churns. The robust production fix is an
 # *allowlist* derived from a registrar pricing feed (a TLD is buyable only if a
-# mainstream registrar actually sells it); see README "Brand-TLD false positives".
+# mainstream registrar actually sells it); see the README's caveats section.
 CLOSED_BRAND = {
     # Amazon Registry brands (delegated, never opened to the public)
     "now", "buy", "book", "song", "tunes", "smile", "wow", "joy", "deal",

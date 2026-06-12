@@ -17,7 +17,7 @@ Outputs results/available_domains.{csv,txt} -- the deliverable.
 Run the full job politely, under a wall-clock budget:
   python candidates.py --source norvig --min-zipf-w1 3.0
   python scan.py --candidates candidates.jsonl --dns-cull \
-                 --per-host-interval 1.5 --deadline-seconds 18000
+                 --base-interval 1.5 --deadline-seconds 18000
 """
 
 import argparse
@@ -123,7 +123,7 @@ def confirm_prices(available, provider, max_create, max_renew):
 
 # --- export -------------------------------------------------------------------
 
-def export(available, taken_via_dns, outdir="results"):
+def export(available, outdir="results"):
     os.makedirs(outdir, exist_ok=True)
     rows = sorted(available, key=lambda r: -r.get("count", 0))
     csv_path = os.path.join(outdir, "available_domains.csv")
@@ -166,30 +166,29 @@ def main():
     ap.add_argument("--max-renew", type=float, default=None)
     args = ap.parse_args()
 
-    cands = load_candidates(args.candidates, args.limit)
-    print(f"loaded {len(cands)} candidates", file=sys.stderr)
+    all_cands = load_candidates(args.candidates, args.limit)
+    print(f"loaded {len(all_cands)} candidates", file=sys.stderr)
 
-    taken_dns = []
+    survivors = all_cands
     if args.dns_cull:
-        cands, taken_dns = dns_cull(cands)
+        survivors, _ = dns_cull(all_cands)
 
-    results = asyncio.run(rdap.run(cands, args.out, inflight=args.inflight,
+    results = asyncio.run(rdap.run(survivors, args.out, inflight=args.inflight,
                                    base_interval=args.base_interval,
                                    deadline_seconds=args.deadline_seconds))
 
-    all_cands = load_candidates(args.candidates, args.limit)
     available = [c for c in all_cands if results.get(c["domain"]) == rdap.AVAILABLE]
 
     if args.confirm_price and available:
         confirmed = confirm_prices(available, args.provider,
                                    args.max_create, args.max_renew)
         buyable = [c for c in confirmed if c.get("within_budget")]
-        export(buyable, taken_dns)
+        export(buyable)
         print(f"\n=== {len(buyable)} BUYABLE (available + in budget) ===")
         for c in sorted(buyable, key=lambda x: x.get("renew_price") or 0)[:60]:
             print(f"  {c['domain']:<26} renew=${c.get('renew_price')}")
     else:
-        export(available, taken_dns)
+        export(available)
         print(f"\n=== {len(available)} AVAILABLE via RDAP "
               f"(price unconfirmed; premium flagged) ===")
         for c in sorted(available, key=lambda x: -x["count"])[:60]:
