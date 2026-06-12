@@ -1,0 +1,8 @@
+aiohttp>=3.9
+tqdm>=4.66
+# DNS pre-cull (NS lookups) -- big politeness/speed win, recommended:
+dnspython>=2.6
+# first-word frequency filtering / scoring:
+wordfreq>=3.0
+# optional, only if you use the NLTK bigram path:
+# nltk>=3.8

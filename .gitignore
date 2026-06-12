@@ -1,0 +1,14 @@
+# envs / caches
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# regenerable intermediates
+.rdap_bootstrap.json
+data/count_2w.txt
+candidates.jsonl
+
+# scratch scan outputs (the curated deliverable lives in results/ and is committed)
+results.jsonl
+results_*.jsonl
